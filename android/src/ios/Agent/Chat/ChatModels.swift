@@ -299,6 +299,10 @@ final class AssistantBlock: Identifiable, ObservableObject {
     @Published var browserURL: String?
     /// LLM-generated concise description of what this tool call does (5-10 words).
     @Published var toolSummary: String?
+    /// [T-tool-language] Language the model was replying in when this block was
+    /// created. Tool cards follow the model rather than a fixed language: a
+    /// Chinese answer gets Chinese labels, an English answer stays English.
+    var toolLanguageChinese: Bool = NanoMuseLocale.isChinese
     /// Wall-clock execution duration (display only, not sent to model).
     @Published var toolDuration: TimeInterval?
     /// Timestamp when tool execution started (internal, for computing duration).
@@ -340,38 +344,42 @@ final class AssistantBlock: Identifiable, ObservableObject {
 
     /// Concise one-line description for compact tool card display.
     var toolDescription: String {
+        let zh = toolLanguageChinese
+        func label(_ chinese: String, _ english: String) -> String { zh ? chinese : english }
         switch kind {
         case .text, .thinking:
             return ""
         case .shellTool(let command):
-            if !command.isEmpty { return command }
+            // Unmapped tools are stored as their name ("codex_exec"), which is
+            // not something to show as a command — fall through to the label.
+            if !command.isEmpty, !ToolTextLanguage.isBareToolName(command) { return command }
             // Parse from content: "$ <command>\n..."
             if content.hasPrefix("$ ") {
                 let firstLine = content.prefix(while: { $0 != "\n" })
                 return String(firstLine.dropFirst(2))
             }
-            return "Shell command"
+            return label("命令", "Shell command")
         case .browserTool(let action):
             if !action.isEmpty { return action }
             if content.hasPrefix("Browser: ") {
                 let firstLine = content.prefix(while: { $0 != "\n" })
                 return String(firstLine.dropFirst(9))
             }
-            return "Browser action"
+            return label("浏览器操作", "Browser action")
         case .fileReadTool(let path):
             let name = (path as NSString).lastPathComponent
-            return (!path.isEmpty && name != "/" && name.contains(".")) ? name : "Read file"
+            return (!path.isEmpty && name != "/" && name.contains(".")) ? name : label("读取文件", "Read file")
         case .fileWriteTool(let path):
             let name = (path as NSString).lastPathComponent
-            return (!path.isEmpty && name != "/" && name.contains(".")) ? name : "Write file"
+            return (!path.isEmpty && name != "/" && name.contains(".")) ? name : label("写入文件", "Write file")
         case .fileEditTool(let path):
             let name = (path as NSString).lastPathComponent
-            return (!path.isEmpty && name != "/" && name.contains(".")) ? name : "Edit file"
+            return (!path.isEmpty && name != "/" && name.contains(".")) ? name : label("编辑文件", "Edit file")
         case .readImageTool(let path):
             let name = (path as NSString).lastPathComponent
-            return (!path.isEmpty && name != "/" && name.contains(".")) ? name : "Read image"
+            return (!path.isEmpty && name != "/" && name.contains(".")) ? name : label("读取图片", "Read image")
         case .memoryTool(let action):
-            return action.isEmpty ? "Memory" : action
+            return action.isEmpty ? label("记忆", "Memory") : action
         case .info:
             return ""
         }
@@ -453,3 +461,60 @@ struct InputAttachment: Identifiable {
     }
 }
 
+
+// MARK: - Tool card language
+
+/// Decides the language of the text the agent writes *about* a tool call —
+/// card labels, live previews, spoken announcements.
+///
+/// The rule is "follow the model, not the device": a reply written in Chinese
+/// gets Chinese tool text, a reply written in English stays English. Detection
+/// is a cheap Han-vs-Latin ratio over text we already have, so it works on
+/// partially streamed strings and needs no extra state.
+enum ToolTextLanguage {
+    /// True when `text` reads as Chinese. A single quoted Chinese word inside
+    /// an English sentence is not enough — Chinese has to carry real weight.
+    static func isChinese(_ text: String?) -> Bool {
+        guard let text, !text.isEmpty else { return false }
+        var han = 0
+        var latin = 0
+        for scalar in text.unicodeScalars {
+            switch scalar.value {
+            case 0x4E00...0x9FFF, 0x3400...0x4DBF, 0xF900...0xFAFF:
+                han += 1
+            case 0x41...0x5A, 0x61...0x7A:
+                latin += 1
+            default:
+                break
+            }
+        }
+        guard han > 0 else { return false }
+        return han * 3 >= latin
+    }
+
+    /// The model's own label for the tool wins, then the reply streamed so far,
+    /// and only when neither exists do we fall back to the device language.
+    static func prefersChinese(modelText: String?, reply: String?) -> Bool {
+        if isChinese(modelText) { return true }
+        if let reply, !reply.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            return isChinese(reply)
+        }
+        return NanoMuseLocale.isChinese
+    }
+
+    /// True when `content` is still the "about to run" placeholder written when
+    /// the tool call started, rather than real streamed output. Covers both
+    /// languages so the streaming paths stay language-agnostic.
+    static func isPlaceholderPreview(_ text: String) -> Bool {
+        text.hasSuffix("Executing...") || text.hasSuffix("执行中…")
+    }
+
+    /// True when `text` is just a tool identifier such as "codex_exec", which the
+    /// card stores as a fallback and must not print as if it were a command.
+    /// Tool identifiers always carry an underscore; plain commands like `ls` do
+    /// not, so they keep being shown verbatim.
+    static func isBareToolName(_ text: String) -> Bool {
+        guard !text.isEmpty, text.contains("_"), !text.contains(" ") else { return false }
+        return text.allSatisfy { $0.isLetter || $0 == "_" }
+    }
+}

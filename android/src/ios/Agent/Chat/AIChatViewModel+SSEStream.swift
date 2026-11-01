@@ -753,8 +753,8 @@ extension AIChatViewModel {
                 // below finds the renamed block (the FIRST tool keeps
                 // the raw id; subsequent collisions get -2 / -3 / ...).
                 let id = dedupeToolCompleteId(rawId)
-                let content = makeToolPreview(name: name, args: args)
                 let assistantText = result.assistantText
+                let content = makeToolPreview(name: name, args: args, reply: assistantText)
                 let textIdx = currentTextBlockIdx
 
                 // Force-flush any dynamically-buffered (extracted but un-sent) TTS
@@ -840,6 +840,12 @@ extension AIChatViewModel {
                     if let desc = args["tool_title"] as? String {
                         messages[msgIdx].blocks[blockIdx].toolSummary = desc
                     }
+                    // [T-tool-language] Cards follow the model's own language for
+                    // this turn instead of a fixed one.
+                    messages[msgIdx].blocks[blockIdx].toolLanguageChinese = ToolTextLanguage.prefersChinese(
+                        modelText: args["tool_title"] as? String,
+                        reply: assistantText
+                    )
                     if let sid = self.sessionId {
                         let blk = messages[msgIdx].blocks[blockIdx]
                         let snippet = blk.toolSummary ?? blk.toolDescription
@@ -1085,22 +1091,31 @@ extension AIChatViewModel {
         }
     }
 
-    nonisolated private func makeToolPreview(name: String, args: [String: Any]) -> String {
+    nonisolated private func makeToolPreview(name: String, args: [String: Any], reply: String?) -> String {
+        // [T-tool-language] Preview text follows the language the model is
+        // answering in, not a fixed one.
+        let zh = ToolTextLanguage.prefersChinese(
+            modelText: args["tool_title"] as? String,
+            reply: reply
+        )
+        func pick(_ chinese: String, _ english: String) -> String { zh ? chinese : english }
+        let arg = (args["path"] as? String) ?? "?"
         switch name {
-        case "shell_execute":
-            return "Executing..."
-        case "file_read":
-            return "Reading \((args["path"] as? String) ?? "?")..."
+        case "shell_execute", "host_exec", "codex_exec", "subagent_dispatch":
+            return pick("执行中…", "Executing...")
+        case "file_read", "host_fs":
+            return pick("读取 \(arg)…", "Reading \(arg)...")
         case "file_write":
-            return "Writing \((args["path"] as? String) ?? "?")..."
+            return pick("写入 \(arg)…", "Writing \(arg)...")
         case "file_edit":
-            return "Editing \((args["path"] as? String) ?? "?")..."
-        case "browser_use":
-            return "Browser: \((args["action"] as? String) ?? "?")..."
+            return pick("编辑 \(arg)…", "Editing \(arg)...")
+        case "browser_use", "minis-browser-use":
+            return pick("浏览器：\((args["action"] as? String) ?? "?")…",
+                        "Browser: \((args["action"] as? String) ?? "?")...")
         case "read_image":
-            return "Reading image \((args["path"] as? String) ?? "?")..."
+            return pick("读取图片 \(arg)…", "Reading image \(arg)...")
         default:
-            return "Tool: \(name)"
+            return pick("工具：\(name)", "Tool: \(name)")
         }
     }
 
@@ -1115,16 +1130,33 @@ extension AIChatViewModel {
     /// in the terminal preview as literal `{"tool_title":"..."}`.
     nonisolated private func toolInputPreview(name: String, json: String) -> (preview: String?, description: String?) {
         let desc = extractPartialStringValue("tool_title", from: json)
+        // [T-tool-language] Live preview text follows the model's language.
+        let zh = ToolTextLanguage.prefersChinese(modelText: desc, reply: nil)
+        func pick(_ chinese: String, _ english: String) -> String { zh ? chinese : english }
 
         // Try to extract the primary parameter value from partial JSON
         switch name {
-        case "shell_execute":
+        case "shell_execute", "host_exec":
             if let val = extractPartialStringValue("command", from: json) {
                 return ("\(val)", desc)
             }
+        case "codex_exec", "subagent_dispatch":
+            // [T-codex-preview] The prompt is the whole request; show its first
+            // line so the card says what the sub-agent is about to do instead of
+            // sitting blank until the call completes.
+            if let prompt = extractPartialStringValue("prompt", from: json) {
+                let firstLine = prompt.prefix(while: { $0 != "\n" })
+                    .trimmingCharacters(in: .whitespaces)
+                if !firstLine.isEmpty { return (String(firstLine), desc) }
+            }
+        case "host_fs":
+            if let op = extractPartialStringValue("op", from: json) {
+                let path = extractPartialStringValue("path", from: json) ?? "?"
+                return ("\(op) \(path)", desc)
+            }
         case "file_read":
             if let val = extractPartialStringValue("path", from: json) {
-                return ("Reading \(val)...", desc)
+                return (pick("读取 \(val)…", "Reading \(val)..."), desc)
             }
         case "file_write":
             let path = extractPartialStringValue("path", from: json)
@@ -1132,22 +1164,24 @@ extension AIChatViewModel {
             if let path, let content {
                 let bytes = content.utf8.count
                 if bytes > 100 {
-                    return ("Writing \(path)  (\(formatBytes(bytes)) received)", desc)
+                    return (pick("写入 \(path)  (已接收 \(formatBytes(bytes)))",
+                                 "Writing \(path)  (\(formatBytes(bytes)) received)"), desc)
                 } else {
-                    return ("Writing \(path)...", desc)
+                    return (pick("写入 \(path)…", "Writing \(path)..."), desc)
                 }
             } else if let path {
-                return ("Writing \(path)...", desc)
+                return (pick("写入 \(path)…", "Writing \(path)..."), desc)
             } else if let content {
                 let bytes = content.utf8.count
                 if bytes > 100 {
-                    return ("Writing...  (\(formatBytes(bytes)) received)", desc)
+                    return (pick("写入…  (已接收 \(formatBytes(bytes)))",
+                                 "Writing...  (\(formatBytes(bytes)) received)"), desc)
                 }
-                return ("Writing...", desc)
+                return (pick("写入…", "Writing..."), desc)
             }
         case "file_edit":
             if let path = extractPartialStringValue("path", from: json) {
-                return ("Editing \(path)...", desc)
+                return (pick("编辑 \(path)…", "Editing \(path)..."), desc)
             }
             // No path yet — leave preview unchanged (don't return "Editing...",
             // which would also overwrite a previously-good preview when the
@@ -1162,11 +1196,11 @@ extension AIChatViewModel {
                 } else {
                     detail = ""
                 }
-                return ("Browser: \(action)\(detail)", desc)
+                return (pick("浏览器：\(action)\(detail)", "Browser: \(action)\(detail)"), desc)
             }
         case "read_image":
             if let val = extractPartialStringValue("path", from: json) {
-                return ("Reading image \(val)...", desc)
+                return (pick("读取图片 \(val)…", "Reading image \(val)..."), desc)
             }
         default:
             break

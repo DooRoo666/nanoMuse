@@ -368,7 +368,7 @@ extension AIChatViewModel {
                     if msgIdx < self.messages.count && blockIdx < self.messages[msgIdx].blocks.count {
                         let current = self.messages[msgIdx].blocks[blockIdx].content
                         var newContent: String
-                        if current.hasSuffix("Executing...") {
+                        if ToolTextLanguage.isPlaceholderPreview(current) {
                             newContent = joined
                         } else {
                             newContent = current + "\n" + joined
@@ -429,7 +429,7 @@ extension AIChatViewModel {
             if msgIdx < messages.count, blockIdx < messages[msgIdx].blocks.count {
                 let existingContent = messages[msgIdx].blocks[blockIdx].content
                 let hasStreamedContent = !existingContent.isEmpty
-                    && !existingContent.hasSuffix("Executing...")
+                    && !ToolTextLanguage.isPlaceholderPreview(existingContent)
                 if !hasStreamedContent {
                     let (cleaned, capturedURLs) = MinisURLMarker.extract(from: result.output)
                     for raw in capturedURLs {
