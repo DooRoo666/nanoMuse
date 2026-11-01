@@ -973,7 +973,15 @@ struct AIChatView: View {
                 vm.browserTakeoverActive = true
             })
         }
-        .sheet(isPresented: $showModelPicker) {
+        .sheet(isPresented: $showModelPicker, onDismiss: {
+            // The picker can bind the model to a session id it creates itself
+            // (draft chat → ensureSessionId), so the notification may arrive
+            // while `vm.sessionId` is still nil and get dropped. Re-reading on
+            // dismiss guarantees the nav-title pill shows the model the user
+            // actually picked instead of the stale default.
+            modelBindingRevision &+= 1
+            refreshTitlePillSession()
+        }) {
             NavigationStack {
                 SessionModelPicker(sessionId: vm.sessionId) {
                     await vm.ensureSessionReturningId()
@@ -1315,8 +1323,15 @@ struct AIChatView: View {
         .onReceive(NotificationCenter.default.publisher(for: .sessionModelBindingChanged)) { note in
             let updatedId = (note.object as? String)
                 ?? (note.userInfo?["sessionId"] as? String)
-            guard let sid = vm.sessionId,
-                  updatedId == nil || updatedId == sid else { return }
+            guard let sid = vm.sessionId else {
+                // Draft chat: the binding was written for a session id this
+                // view has not picked up yet. Refresh anyway so the pill and
+                // title reflect the new selection as soon as the id lands.
+                modelBindingRevision &+= 1
+                refreshTitlePillSession()
+                return
+            }
+            guard updatedId == nil || updatedId == sid else { return }
             modelBindingRevision &+= 1
             refreshTitlePillSession()
         }
